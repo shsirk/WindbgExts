@@ -2,6 +2,8 @@
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Policy;
+using System.Text;
 using WinDbgCSharpPluginTemplate.Debugger;
 
 namespace WinDbgCSharpPluginTemplate
@@ -26,6 +28,10 @@ namespace WinDbgCSharpPluginTemplate
         [DllImport("dbgeng.dll")]
         internal static extern uint DebugCreate(ref Guid InterfaceId, [MarshalAs(UnmanagedType.IUnknown)] out object Interface);
 
+        [DllImport("shell32.dll", SetLastError = true)]
+        private static extern IntPtr CommandLineToArgvW(
+            [MarshalAs(UnmanagedType.LPWStr)] string lpCmdLine, out int pNumArgs);
+
         internal static HRESULT LastHR;
 
         internal static IDebugClient5 client = null;
@@ -45,6 +51,88 @@ namespace WinDbgCSharpPluginTemplate
             }
             catch { }
             return hr;
+        }
+
+        private static string[] GetCommandLineArgs(string commandLine)
+        {
+            int argc;
+            var argv = CommandLineToArgvW(commandLine, out argc);
+            if (argv == IntPtr.Zero)
+                return null;
+            try
+            {
+                var args = new string[argc];
+                for (var i = 0; i < args.Length; i++)
+                {
+                    var p = Marshal.ReadIntPtr(argv, i * IntPtr.Size);
+                    args[i] = Marshal.PtrToStringUni(p);
+                }
+
+                return args;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(argv);
+            }
+        }
+
+        internal static AppDomain currDomain = null;
+
+        private static void SetupAppDomain()
+        {
+            ResolveEventHandler resolver = (o, e) =>
+            {
+                var directory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                var name = new AssemblyName(e.Name);
+                var path = Path.Combine(directory, $"{name.Name}.dll");
+                return Assembly.LoadFrom(path);
+            };
+
+            var setup = new AppDomainSetup();
+            var assembly = Assembly.GetExecutingAssembly().Location;
+            setup.ApplicationBase = assembly.Substring(0, assembly.LastIndexOf('\\') + 1);
+
+            setup.ConfigurationFile = assembly + ".config";
+
+            // Set up the Evidence
+            var baseEvidence = AppDomain.CurrentDomain.Evidence;
+            var evidence = new Evidence(baseEvidence);
+
+            currDomain = AppDomain.CreateDomain("WindbgExts", AppDomain.CurrentDomain.Evidence, setup);
+            currDomain.UnhandledException += CurrDomain_UnhandledException;
+
+            AppDomain.CurrentDomain.AssemblyResolve += resolver;
+            currDomain.AssemblyResolve += resolver;
+
+        }
+
+        private static void CurrDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            InitializeApis();
+            if (e.ExceptionObject is Exception exception)
+            {
+                string message = GetExceptionMessage(exception);
+                WriteLine(message);
+            }
+        }
+
+        private static string GetExceptionMessage(Exception e)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"{e.GetType().FullName} - {e.Message}");
+            sb.AppendLine($"{e.StackTrace}");
+            if (e.InnerException != null)
+            {
+                sb.AppendLine($"Inner exception: ");
+                sb.AppendLine(GetExceptionMessage(e.InnerException));
+            }
+            return sb.ToString();
+        }
+
+        internal static string GetLogPath()
+        {
+            var assemblyPath = Assembly.GetExecutingAssembly().Location;
+            return Path.Combine(Path.GetDirectoryName(assemblyPath), "windbg_template_log.txt");
         }
 
         private static IDebugClient CreateIDebugClient()
@@ -78,11 +166,7 @@ namespace WinDbgCSharpPluginTemplate
             }
         }
 
-        internal static string GetLogPath()
-        {
-            var assemblyPath = Assembly.GetExecutingAssembly().Location;
-            return Path.Combine(Path.GetDirectoryName(assemblyPath), "windbg_template_log.txt");
-        }
+        
 
         #region Mandatory
 
@@ -93,6 +177,9 @@ namespace WinDbgCSharpPluginTemplate
             uint Minor = 0;
             Version = (Major << 16) + Minor;
             Flags = 0;
+
+            //create appdomain if you want
+            //SetupAppDomain();
 
             InitializeApis();
             if (client == null || control == null)
@@ -110,13 +197,15 @@ namespace WinDbgCSharpPluginTemplate
         [DllExport]
         public static HRESULT DebugExtensionUninitialize()
         {
+            if (currDomain != null)
+                AppDomain.Unload(currDomain);
+
             return HRESULT.S_OK;
         }
 
         #endregion
 
         #region Commands
-
 
         [DllExport]
         public static HRESULT help(IntPtr client, [MarshalAs(UnmanagedType.LPStr)] string Args)
